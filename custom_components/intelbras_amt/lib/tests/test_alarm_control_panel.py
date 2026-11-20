@@ -34,6 +34,9 @@ def alarm_module(monkeypatch):
         },
         "homeassistant.config_entries": {"ConfigEntry": object},
         "homeassistant.core": {"HomeAssistant": object, "callback": lambda fn: fn},
+        "homeassistant.exceptions": {
+            "HomeAssistantError": type("HomeAssistantError", (Exception,), {}),
+        },
         "homeassistant.helpers.entity_platform": {"AddEntitiesCallback": object},
         "homeassistant.helpers.update_coordinator": {"CoordinatorEntity": CoordinatorEntity},
         "custom_components.intelbras_amt.coordinator": {"AMTCoordinator": object},

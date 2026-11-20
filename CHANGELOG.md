@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.0-mr1 — 2026-11-20
+
+- Painel de alarme passa a usar a **senha digitada no teclado** (`code`),
+  conferida pela própria central. Desarmar exige a senha sempre; ao armar,
+  se o `code` vier vazio (ex.: automações), usa a senha salva na configuração.
+- Comandos de arme/desarme agora **aguardam a resposta da central**
+  (`wait_response=True`) e interpretam ACK/NACK. Senha recusada ou outros
+  erros levantam `HomeAssistantError` com mensagem em português, exibida na
+  interface. A senha nunca é registrada em log.
+- Teclado passa a aparecer também ao armar (`code_arm_required = True`).
+- Senha sempre tratada como texto de dígitos (nunca convertida para número),
+  preservando zeros à esquerda.
+
 ## 1.2.0 — 2026-09-15
 
 - Botão **Limpar disparo (beta)** para AMT 2018 E/EG/E SMART, AMT 1000 Smart e AMT 4010.

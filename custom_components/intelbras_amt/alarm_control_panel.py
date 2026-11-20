@@ -12,13 +12,14 @@ from homeassistant.components.alarm_control_panel import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 # Importa da biblioteca local
 from .lib.server import AMTServer
 from .lib.protocol.commands import ActivationCommand, DeactivationCommand
-from .lib.const import PartitionCode
+from .lib.const import PartitionCode, ResponseCode
 
 from .const import DOMAIN, CONF_PASSWORD, ATTR_CONNECTED, ATTR_LAST_HEARTBEAT
 from .coordinator import AMTCoordinator
@@ -44,7 +45,10 @@ class IntelbrasAMTAlarm(CoordinatorEntity[AMTCoordinator], AlarmControlPanelEnti
     _attr_has_entity_name = True
     _attr_name = "Alarme"
     _attr_code_format = CodeFormat.NUMBER
-    _attr_code_arm_required = False  # Usa senha salva na config
+    # O teclado aparece ao armar e ao desarmar. A senha digitada é conferida
+    # pela central: para desarmar é sempre obrigatória; para armar, se vier
+    # vazia (ex.: automações), usamos a senha salva na configuração.
+    _attr_code_arm_required = True
     _attr_supported_features = (
         AlarmControlPanelEntityFeature.ARM_HOME |
         AlarmControlPanelEntityFeature.ARM_AWAY
@@ -259,65 +263,104 @@ class IntelbrasAMTAlarm(CoordinatorEntity[AMTCoordinator], AlarmControlPanelEnti
 
     async def async_alarm_arm_away(self, code: str | None = None) -> None:
         """Arma o alarme no modo away (todas as zonas)."""
-        await self._arm_alarm(partition=None)
+        await self._arm_alarm(code, partition=None)
 
     async def async_alarm_arm_home(self, code: str | None = None) -> None:
         """Arma o alarme no modo home (stay)."""
-        await self._arm_alarm(partition=PartitionCode.STAY_MODE)
+        await self._arm_alarm(code, partition=PartitionCode.STAY_MODE)
 
     async def async_alarm_disarm(self, code: str | None = None) -> None:
-        """Desarma o alarme."""
-        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
-        server: AMTServer = entry_data.get("server")
-        connection_id = entry_data.get("connection_id")
-        password = entry_data.get("password", "")
-        
-        if not server or not connection_id:
-            _LOGGER.error("Central não conectada, não é possível desarmar")
-            return
-        
-        try:
-            # Desarma todas as áreas
-            cmd = DeactivationCommand.disarm_all(password)
-            await server.send_command(
-                connection_id,
-                cmd.build_net_frame(),
-                wait_response=False,
-            )
-            _LOGGER.info("Comando de desarme enviado para a central")
-                
-        except TimeoutError:
-            _LOGGER.error("Timeout aguardando resposta da central")
-        except Exception as e:
-            _LOGGER.error(f"Erro ao enviar comando: {e}")
+        """Desarma o alarme (a senha digitada é sempre obrigatória)."""
+        password = self._resolve_password(code, require_code=True)
+        await self._send_and_check(
+            DeactivationCommand.disarm_all(password),
+            action="desarmar",
+        )
 
-    async def _arm_alarm(self, partition: PartitionCode | None = None) -> None:
-        """Envia comando de ativação para a central."""
-        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
-        server: AMTServer = entry_data.get("server")
-        connection_id = entry_data.get("connection_id")
-        password = entry_data.get("password", "")
-        
-        if not server or not connection_id:
-            _LOGGER.error("Central não conectada, não é possível armar")
-            return
-        
-        # Cria comando de ativação
+    async def _arm_alarm(
+        self,
+        code: str | None = None,
+        partition: PartitionCode | None = None,
+    ) -> None:
+        """Envia comando de ativação para a central.
+
+        Ao armar, a senha digitada é usada quando presente; se vier vazia
+        (ex.: automações), usamos a senha salva na configuração.
+        """
+        password = self._resolve_password(code, require_code=False)
+
         if partition:
             cmd = ActivationCommand(password=password, partition=partition)
         else:
             cmd = ActivationCommand.arm_all(password=password)
-        
-        try:
-            # Envia comando e aguarda resposta
-            await server.send_command(
-                connection_id,
-                cmd.build_net_frame(),
-                wait_response=False,
+
+        await self._send_and_check(cmd, action="armar")
+
+    def _resolve_password(self, code: str | None, *, require_code: bool) -> str:
+        """Define a senha a enviar à central, sem registrá-la em log.
+
+        - require_code=True (desarme): a senha digitada é obrigatória.
+        - require_code=False (arme): usa a senha digitada; se vier vazia,
+          cai para a senha salva na configuração.
+
+        A senha é sempre tratada como texto de dígitos (nunca convertida para
+        número), preservando zeros à esquerda.
+        """
+        typed = (code or "").strip()
+        if typed:
+            password = typed
+        elif require_code:
+            raise HomeAssistantError("É necessário digitar a senha para desarmar.")
+        else:
+            entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+            password = entry_data.get("password", "")
+
+        if not (password.isascii() and password.isdigit() and 4 <= len(password) <= 6):
+            raise HomeAssistantError("Senha inválida: use de 4 a 6 dígitos.")
+        return password
+
+    async def _send_and_check(self, command, *, action: str) -> None:
+        """Envia um comando à central, confere a resposta e sinaliza erros.
+
+        Levanta HomeAssistantError (exibido na interface do HA) quando a central
+        recusa o comando, não responde ou está offline. Nunca registra a senha.
+        """
+        entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        server: AMTServer = entry_data.get("server")
+        connection_id = entry_data.get("connection_id")
+
+        if not server or not connection_id:
+            raise HomeAssistantError(
+                f"Central não conectada; não foi possível {action}."
             )
-            _LOGGER.info("Comando de arme enviado para a central")
-                
-        except TimeoutError:
-            _LOGGER.error("Timeout aguardando resposta da central")
-        except Exception as e:
-            _LOGGER.error(f"Erro ao enviar comando: {e}")
+
+        try:
+            response = await server.send_command(
+                connection_id,
+                command.build_net_frame(),
+                wait_response=True,
+            )
+        except TimeoutError as err:
+            _LOGGER.error("Timeout ao %s: sem resposta da central", action)
+            raise HomeAssistantError(
+                f"Sem resposta da central ao {action} (timeout)."
+            ) from err
+        except HomeAssistantError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Erro ao %s: %s", action, err)
+            raise HomeAssistantError(
+                f"Falha de comunicação com a central ao {action}."
+            ) from err
+
+        if response is None or not response.is_success:
+            if response is not None and response.error_code == ResponseCode.NACK_WRONG_PASSWORD:
+                _LOGGER.warning("Central recusou %s: senha incorreta", action)
+                raise HomeAssistantError("Senha recusada pela central.")
+            message = response.message if response is not None else "sem resposta"
+            _LOGGER.warning("Central recusou %s: %s", action, message)
+            raise HomeAssistantError(
+                f"Central recusou o comando ao {action} ({message})."
+            )
+
+        _LOGGER.info("Comando de %s confirmado pela central", action)
